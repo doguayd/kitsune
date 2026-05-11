@@ -108,8 +108,3 @@ listening → transcribing → thinking → speaking → listening …
 - No button presses needed during the loop
 - Click **✕ Kapat** to exit at any time
 
----
-
-## License
-
-MIT
