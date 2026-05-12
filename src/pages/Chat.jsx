@@ -22,13 +22,30 @@ function blobToBase64(blob) {
   })
 }
 
-function playAudio(src) {
-  return new Promise(resolve => {
-    const audio = new Audio(src)
-    audio.onended = resolve
-    audio.onerror = resolve
-    audio.play().catch(resolve)
-  })
+/**
+ * AudioContext tabanlı oynatma — Electron renderer'da new Audio() güvenilmez.
+ * base64 ham string alır (data:uri değil).
+ */
+async function playAudio(base64) {
+  try {
+    const binary = atob(base64)
+    const bytes  = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+
+    const ctx    = new AudioContext()
+    const buffer = await ctx.decodeAudioData(bytes.buffer)
+
+    await new Promise(resolve => {
+      const source = ctx.createBufferSource()
+      source.buffer = buffer
+      source.connect(ctx.destination)
+      source.onended = resolve
+      source.start()
+    })
+    ctx.close()
+  } catch (err) {
+    console.error('[playAudio]', err)
+  }
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -112,12 +129,14 @@ async function recordWithVAD(isCancelled) {
 function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnlineRef }) {
   const [voiceMode,  setVoiceMode]  = useState(false)
   const [voiceState, setVoiceState] = useState('idle')
+  const [timings,    setTimings]    = useState({}) // { stt, llm, tts } ms
   const activeRef = useRef(false)
 
   const stop = useCallback(() => {
     activeRef.current = false
     setVoiceMode(false)
     setVoiceState('idle')
+    setTimings({})
   }, [])
 
   const start = useCallback(() => {
@@ -129,6 +148,7 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
       while (activeRef.current) {
         // ── Listen ──────────────────────────────────
         setVoiceState('listening')
+        setTimings({})
         let blob = null
         try {
           blob = await recordWithVAD(() => !activeRef.current)
@@ -138,11 +158,12 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
           continue
         }
         if (!activeRef.current) break
-        if (!blob) continue   // cancelled or no speech
+        if (!blob) continue
 
         // ── Transcribe ───────────────────────────────
         setVoiceState('transcribing')
         let text = ''
+        const t0stt = Date.now()
         try {
           const b64 = await blobToBase64(blob)
           const { data } = await voiceApi.post('/api/voice/transcribe', {
@@ -154,17 +175,24 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
         } catch (err) {
           console.error('[Voice] transcribe error:', err)
         }
+        const sttMs = Date.now() - t0stt
+        setTimings(p => ({ ...p, stt: sttMs }))
+        console.log(`[Voice] STT: ${sttMs}ms → "${text}"`)
         if (!activeRef.current) break
-        if (!text) continue   // nothing recognised
+        if (!text) continue
 
         // ── Think (send to AI) ───────────────────────
         setVoiceState('thinking')
+        const t0llm = Date.now()
         try {
           await sendMessageRef.current(text)
         } catch (err) {
           console.error('[Voice] sendMessage error:', err)
           continue
         }
+        const llmMs = Date.now() - t0llm
+        setTimings(p => ({ ...p, llm: llmMs }))
+        console.log(`[Voice] LLM: ${llmMs}ms`)
         if (!activeRef.current) break
 
         // ── Speak (TTS) ──────────────────────────────
@@ -173,13 +201,17 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
           const lastAI = [...msgs].reverse().find(m => m.role === 'assistant')
           if (lastAI) {
             setVoiceState('speaking')
+            const t0tts = Date.now()
             try {
               const { data: td } = await voiceApi.post('/api/voice/synthesize', {
                 text: lastAI.content,
                 language_code: langCode
               })
+              const ttsMs = Date.now() - t0tts
+              setTimings(p => ({ ...p, tts: ttsMs }))
+              console.log(`[Voice] TTS synth: ${ttsMs}ms`)
               if (activeRef.current) {
-                await playAudio(`data:audio/wav;base64,${td.audio_base64}`)
+                await playAudio(td.audio_base64)
               }
             } catch (err) {
               console.error('[Voice] TTS error:', err)
@@ -188,9 +220,9 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
         }
       }
 
-      // Loop ended
       setVoiceState('idle')
       setVoiceMode(false)
+      setTimings({})
     })()
   }, [langCode, sendMessageRef, messagesRef, ttsOnlineRef])
 
@@ -199,10 +231,9 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
     else start()
   }, [start, stop])
 
-  // Clean up if component unmounts while voice is active
   useEffect(() => () => { activeRef.current = false }, [])
 
-  return { voiceMode, voiceState, toggle, stop }
+  return { voiceMode, voiceState, timings, toggle, stop }
 }
 
 // ─── Mic recording hook (for manual "speak → send" button) ───────────────────
@@ -324,7 +355,7 @@ export default function Chat() {
     langCode,
     sendMessageRef,
     messagesRef,
-    ttsOnlineRef
+    ttsOnlineRef,
   })
 
   useEffect(() => {
@@ -416,7 +447,7 @@ export default function Chat() {
             transition={{ duration: 0.2 }}
             className="overflow-hidden shrink-0"
           >
-            <VoiceStatusBar state={voice.voiceState} onStop={voice.stop} />
+            <VoiceStatusBar state={voice.voiceState} timings={voice.timings} onStop={voice.stop} />
           </motion.div>
         )}
       </AnimatePresence>
@@ -534,16 +565,16 @@ const VOICE_STATES = {
   idle:         { icon: '⏳', label: 'Hazırlanıyor…',      color: '#6b7280' },
 }
 
-function VoiceStatusBar({ state, onStop }) {
+function VoiceStatusBar({ state, timings, onStop }) {
   const s = VOICE_STATES[state] ?? VOICE_STATES.idle
+
+  // Format ms → "1.2s"
+  const fmt = ms => ms != null ? `${(ms / 1000).toFixed(1)}s` : null
 
   return (
     <div
       className="flex items-center gap-3 px-5 py-3"
-      style={{
-        background: s.color + '10',
-        borderBottom: `1px solid ${s.color}30`
-      }}
+      style={{ background: s.color + '10', borderBottom: `1px solid ${s.color}30` }}
     >
       <motion.span
         key={state}
@@ -564,12 +595,8 @@ function VoiceStatusBar({ state, onStop }) {
         {s.label}
       </span>
 
-      {/* State dots */}
-      {(state === 'thinking' || state === 'transcribing') && (
-        <Dots />
-      )}
+      {(state === 'thinking' || state === 'transcribing') && <Dots />}
 
-      {/* Listening pulse rings */}
       {state === 'listening' && (
         <div className="relative flex items-center justify-center w-5 h-5">
           {[0, 1].map(i => (
@@ -582,6 +609,27 @@ function VoiceStatusBar({ state, onStop }) {
             />
           ))}
           <div className="w-2 h-2 rounded-full" style={{ background: s.color }} />
+        </div>
+      )}
+
+      {/* Timing badges — shown after the first full cycle */}
+      {(timings.stt != null || timings.llm != null || timings.tts != null) && (
+        <div className="flex gap-2 ml-2">
+          {timings.stt != null && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
+              🎙 {fmt(timings.stt)}
+            </span>
+          )}
+          {timings.llm != null && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
+              🦊 {fmt(timings.llm)}
+            </span>
+          )}
+          {timings.tts != null && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
+              🔊 {fmt(timings.tts)}
+            </span>
+          )}
         </div>
       )}
 
