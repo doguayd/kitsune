@@ -82,6 +82,11 @@ router.post('/message', async (req, res) => {
       'INSERT INTO messages (session_id, role, content, corrections) VALUES (?, ?, ?, ?)'
     ).run(session_id, 'assistant', cleanContent, corrections)
 
+    // +5 XP for chat participation
+    db.prepare(
+      'UPDATE user_languages SET xp = xp + 5 WHERE language_code = ? AND user_id = 1'
+    ).run(session.language_code)
+
     res.json({ content: cleanContent, corrections })
   } catch (err) {
     console.error('[Chat] Ollama error:', err.message)

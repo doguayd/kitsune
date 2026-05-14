@@ -7,6 +7,7 @@ import Dashboard from './pages/Dashboard'
 import Languages from './pages/Languages'
 import Assessment from './pages/Assessment'
 import Onboarding from './pages/Onboarding'
+import Learn from './pages/Learn'
 import { useStore } from './store/useStore'
 
 function FirstLaunchGuard({ children }) {
@@ -46,6 +47,7 @@ export default function App() {
             <Route path="/languages"   element={<Languages />} />
             <Route path="/assessment"  element={<Assessment />} />
             <Route path="/onboarding"  element={<Onboarding />} />
+            <Route path="/learn"       element={<Learn />} />
             <Route path="*"            element={<Navigate to="/" />} />
           </Routes>
         </FirstLaunchGuard>

@@ -3,13 +3,14 @@ import { useSearchParams, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useStore } from '../store/useStore'
 import { api, voiceApi } from '../services/api'
+import FoxAvatar from '../components/FoxAvatar'
 
 const SCENARIOS = [
-  { id: 'free',       label: 'Serbest Sohbet',  icon: '💬' },
-  { id: 'restaurant', label: 'Restoran',         icon: '🍽️' },
-  { id: 'business',   label: 'İş Toplantısı',   icon: '💼' },
-  { id: 'travel',     label: 'Seyahat',          icon: '✈️' },
-  { id: 'shopping',   label: 'Alışveriş',        icon: '🛍️' },
+  { id: 'free',       label: 'Serbest',   icon: '💬' },
+  { id: 'restaurant', label: 'Restoran',  icon: '🍽️' },
+  { id: 'business',   label: 'İş',        icon: '💼' },
+  { id: 'travel',     label: 'Seyahat',   icon: '✈️' },
+  { id: 'shopping',   label: 'Alışveriş', icon: '🛍️' },
 ]
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
@@ -22,25 +23,19 @@ function blobToBase64(blob) {
   })
 }
 
-/**
- * AudioContext tabanlı oynatma — Electron renderer'da new Audio() güvenilmez.
- * base64 ham string alır (data:uri değil).
- */
 async function playAudio(base64) {
   try {
     const binary = atob(base64)
     const bytes  = new Uint8Array(binary.length)
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-
     const ctx    = new AudioContext()
     const buffer = await ctx.decodeAudioData(bytes.buffer)
-
     await new Promise(resolve => {
-      const source = ctx.createBufferSource()
-      source.buffer = buffer
-      source.connect(ctx.destination)
-      source.onended = resolve
-      source.start()
+      const src = ctx.createBufferSource()
+      src.buffer = buffer
+      src.connect(ctx.destination)
+      src.onended = resolve
+      src.start()
     })
     ctx.close()
   } catch (err) {
@@ -50,11 +45,6 @@ async function playAudio(base64) {
 
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-/**
- * Records audio with VAD.
- * Resolves with a Blob when ≥1.5s of silence follows speech.
- * Resolves with null if isCancelled() becomes true or no speech is detected.
- */
 async function recordWithVAD(isCancelled) {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
   const ctx    = new AudioContext()
@@ -69,49 +59,33 @@ async function recordWithVAD(isCancelled) {
     mr.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data) }
     mr.start(100)
 
-    // VAD: returns true if speech was detected, false if cancelled
     const hasSpeech = await new Promise(resolve => {
-      const data = new Uint8Array(analyser.frequencyBinCount)
-      const THRESH     = 12    // RMS threshold (0–128 scale)
-      const SILENCE_MS = 1500  // silence after speech → stop
-      let speechDetected = false
-      let silenceStart   = null
-      let raf
+      const data       = new Uint8Array(analyser.frequencyBinCount)
+      const THRESH     = 12
+      const SILENCE_MS = 1500
+      let speechDetected = false, silenceStart = null, raf
 
       const tick = () => {
         if (isCancelled()) { cancelAnimationFrame(raf); resolve(false); return }
-
         analyser.getByteTimeDomainData(data)
-        const rms = Math.sqrt(
-          data.reduce((sum, v) => sum + (v - 128) ** 2, 0) / data.length
-        )
-
-        if (rms > THRESH) {
-          speechDetected = true
-          silenceStart   = null
-        } else if (speechDetected) {
+        const rms = Math.sqrt(data.reduce((s, v) => s + (v - 128) ** 2, 0) / data.length)
+        if (rms > THRESH) { speechDetected = true; silenceStart = null }
+        else if (speechDetected) {
           if (!silenceStart) silenceStart = Date.now()
-          else if (Date.now() - silenceStart > SILENCE_MS) {
-            cancelAnimationFrame(raf)
-            resolve(true)
-            return
-          }
+          else if (Date.now() - silenceStart > SILENCE_MS) { cancelAnimationFrame(raf); resolve(true); return }
         }
         raf = requestAnimationFrame(tick)
       }
       raf = requestAnimationFrame(tick)
     })
 
-    // Drain remaining audio chunks
     await new Promise(res => {
       mr.onstop = res
-      if (mr.state !== 'inactive') mr.stop()
-      else res()
+      if (mr.state !== 'inactive') mr.stop(); else res()
     })
 
     if (!hasSpeech || chunks.length === 0) return null
     return new Blob(chunks, { type: 'audio/webm' })
-
   } finally {
     try { ctx.close() } catch {}
     stream.getTracks().forEach(t => t.stop())
@@ -119,17 +93,11 @@ async function recordWithVAD(isCancelled) {
 }
 
 // ─── Voice Conversation hook ──────────────────────────────────────────────────
-/**
- * Manages the voice conversation loop:
- *   listening → transcribing → thinking → speaking → listening …
- *
- * Uses refs for sendMessage / messages / ttsOnline so the loop always
- * reads the latest values without needing to restart.
- */
 function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnlineRef }) {
   const [voiceMode,  setVoiceMode]  = useState(false)
   const [voiceState, setVoiceState] = useState('idle')
-  const [timings,    setTimings]    = useState({}) // { stt, llm, tts } ms
+  const [timings,    setTimings]    = useState({})
+  const [lastHeard,  setLastHeard]  = useState('')
   const activeRef = useRef(false)
 
   const stop = useCallback(() => {
@@ -137,6 +105,7 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
     setVoiceMode(false)
     setVoiceState('idle')
     setTimings({})
+    setLastHeard('')
   }, [])
 
   const start = useCallback(() => {
@@ -146,56 +115,41 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
 
     ;(async () => {
       while (activeRef.current) {
-        // ── Listen ──────────────────────────────────
         setVoiceState('listening')
         setTimings({})
+
         let blob = null
-        try {
-          blob = await recordWithVAD(() => !activeRef.current)
-        } catch (err) {
-          console.error('[Voice] mic error:', err)
-          await sleep(500)
-          continue
-        }
+        try { blob = await recordWithVAD(() => !activeRef.current) }
+        catch (err) { console.error('[Voice] mic:', err); await sleep(500); continue }
         if (!activeRef.current) break
         if (!blob) continue
 
-        // ── Transcribe ───────────────────────────────
         setVoiceState('transcribing')
         let text = ''
         const t0stt = Date.now()
         try {
-          const b64 = await blobToBase64(blob)
+          const b64    = await blobToBase64(blob)
           const { data } = await voiceApi.post('/api/voice/transcribe', {
-            audio_base64: b64,
-            language_code: langCode,
-            ext: 'webm'
+            audio_base64: b64, language_code: langCode, ext: 'webm'
           })
           text = data.text?.trim() ?? ''
-        } catch (err) {
-          console.error('[Voice] transcribe error:', err)
-        }
+        } catch (err) { console.error('[Voice] transcribe:', err) }
         const sttMs = Date.now() - t0stt
         setTimings(p => ({ ...p, stt: sttMs }))
         console.log(`[Voice] STT: ${sttMs}ms → "${text}"`)
         if (!activeRef.current) break
         if (!text) continue
+        setLastHeard(text)
 
-        // ── Think (send to AI) ───────────────────────
         setVoiceState('thinking')
         const t0llm = Date.now()
-        try {
-          await sendMessageRef.current(text)
-        } catch (err) {
-          console.error('[Voice] sendMessage error:', err)
-          continue
-        }
+        try { await sendMessageRef.current(text) }
+        catch (err) { console.error('[Voice] send:', err); continue }
         const llmMs = Date.now() - t0llm
         setTimings(p => ({ ...p, llm: llmMs }))
         console.log(`[Voice] LLM: ${llmMs}ms`)
         if (!activeRef.current) break
 
-        // ── Speak (TTS) ──────────────────────────────
         if (ttsOnlineRef.current) {
           const msgs   = messagesRef.current
           const lastAI = [...msgs].reverse().find(m => m.role === 'assistant')
@@ -204,22 +158,16 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
             const t0tts = Date.now()
             try {
               const { data: td } = await voiceApi.post('/api/voice/synthesize', {
-                text: lastAI.content,
-                language_code: langCode
+                text: lastAI.content, language_code: langCode
               })
               const ttsMs = Date.now() - t0tts
               setTimings(p => ({ ...p, tts: ttsMs }))
-              console.log(`[Voice] TTS synth: ${ttsMs}ms`)
-              if (activeRef.current) {
-                await playAudio(td.audio_base64)
-              }
-            } catch (err) {
-              console.error('[Voice] TTS error:', err)
-            }
+              console.log(`[Voice] TTS: ${ttsMs}ms`)
+              if (activeRef.current) await playAudio(td.audio_base64)
+            } catch (err) { console.error('[Voice] TTS:', err) }
           }
         }
       }
-
       setVoiceState('idle')
       setVoiceMode(false)
       setTimings({})
@@ -227,16 +175,15 @@ function useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnline
   }, [langCode, sendMessageRef, messagesRef, ttsOnlineRef])
 
   const toggle = useCallback(() => {
-    if (activeRef.current) stop()
-    else start()
+    if (activeRef.current) stop(); else start()
   }, [start, stop])
 
   useEffect(() => () => { activeRef.current = false }, [])
 
-  return { voiceMode, voiceState, timings, toggle, stop }
+  return { voiceMode, voiceState, timings, lastHeard, toggle, stop }
 }
 
-// ─── Mic recording hook (for manual "speak → send" button) ───────────────────
+// ─── Manual mic hook ──────────────────────────────────────────────────────────
 function useMicRecorder() {
   const [recording,    setRecording]    = useState(false)
   const [transcribing, setTranscribing] = useState(false)
@@ -252,9 +199,7 @@ function useMicRecorder() {
       mr.start()
       mediaRef.current = mr
       setRecording(true)
-    } catch (err) {
-      console.error('[Mic] getUserMedia error:', err)
-    }
+    } catch (err) { console.error('[Mic]', err) }
   }, [])
 
   const stop = useCallback((langCode, onResult) => {
@@ -269,17 +214,11 @@ function useMicRecorder() {
         const blob   = new Blob(chunksRef.current, { type: 'audio/webm' })
         const base64 = await blobToBase64(blob)
         const { data } = await voiceApi.post('/api/voice/transcribe', {
-          audio_base64: base64,
-          language_code: langCode,
-          ext: 'webm'
+          audio_base64: base64, language_code: langCode, ext: 'webm'
         })
         onResult(data.text ?? '')
-      } catch (err) {
-        console.error('[Mic] Transcribe error:', err)
-        onResult('')
-      } finally {
-        setTranscribing(false)
-      }
+      } catch (err) { console.error('[Mic] transcribe:', err); onResult('') }
+      finally { setTranscribing(false) }
     }
     mr.stop()
   }, [])
@@ -287,17 +226,13 @@ function useMicRecorder() {
   return { recording, transcribing, start, stop }
 }
 
-// ─── TTS hook (for manual "Dinle" button on each message) ────────────────────
+// ─── TTS hook (manual Dinle button) ──────────────────────────────────────────
 function useTTS() {
   const [loadingId, setLoadingId] = useState(null)
   const [playingId, setPlayingId] = useState(null)
-  const audioRef = useRef(null)
   const cacheRef = useRef({})
 
   const play = useCallback(async (msgId, text, langCode) => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null }
-    setPlayingId(null)
-
     let base64 = cacheRef.current[msgId]
     if (!base64) {
       setLoadingId(msgId)
@@ -305,43 +240,29 @@ function useTTS() {
         const { data } = await voiceApi.post('/api/voice/synthesize', { text, language_code: langCode })
         base64 = data.audio_base64
         cacheRef.current[msgId] = base64
-      } catch (err) {
-        console.error('[TTS] Error:', err)
-        return
-      } finally {
-        setLoadingId(null)
-      }
+      } catch (err) { console.error('[TTS]', err); return }
+      finally { setLoadingId(null) }
     }
-
-    const audio = new Audio(`data:audio/wav;base64,${base64}`)
-    audioRef.current = audio
     setPlayingId(msgId)
-    audio.onended = () => setPlayingId(null)
-    audio.onerror = () => setPlayingId(null)
-    audio.play()
+    try { await playAudio(base64) } finally { setPlayingId(null) }
   }, [])
 
-  const stop = useCallback(() => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null }
-    setPlayingId(null)
-  }, [])
-
+  const stop = useCallback(() => setPlayingId(null), [])
   return { loadingId, playingId, play, stop }
 }
 
 // ─── Main component ────────────────────────────────────────────────────────────
 export default function Chat() {
-  const [params]  = useSearchParams()
-  const navigate  = useNavigate()
-  const langCode  = params.get('lang') ?? 'en'
+  const [params]   = useSearchParams()
+  const navigate   = useNavigate()
+  const langCode   = params.get('lang') ?? 'en'
   const [scenario, setScenario] = useState('free')
   const [input,    setInput]    = useState('')
-  const bottomRef = useRef(null)
+  const bottomRef  = useRef(null)
 
   const { startChat, sendMessage, messages, chatLoading, ollamaOnline, ttsOnline, user } = useStore()
   const userLang = user?.languages?.find(l => l.language_code === langCode)
 
-  // Stable refs for the voice conversation loop
   const sendMessageRef = useRef(sendMessage)
   const messagesRef    = useRef(messages)
   const ttsOnlineRef   = useRef(ttsOnline)
@@ -351,12 +272,7 @@ export default function Chat() {
 
   const mic   = useMicRecorder()
   const tts   = useTTS()
-  const voice = useVoiceConversation({
-    langCode,
-    sendMessageRef,
-    messagesRef,
-    ttsOnlineRef,
-  })
+  const voice = useVoiceConversation({ langCode, sendMessageRef, messagesRef, ttsOnlineRef })
 
   useEffect(() => {
     if (!user) return
@@ -368,15 +284,24 @@ export default function Chat() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Stop voice mode if user navigates away
   useEffect(() => () => voice.stop(), [])
+
+  // Derive fox state from current activity
+  const foxState = voice.voiceMode
+    ? voice.voiceState
+    : mic.transcribing
+      ? 'transcribing'
+      : mic.recording
+        ? 'listening'
+        : chatLoading
+          ? 'thinking'
+          : 'idle'
 
   const handleSend = async () => {
     const text = input.trim()
     if (!text || chatLoading || !ollamaOnline) return
     setInput('')
-    try { await sendMessage(text) }
-    catch (e) { console.error(e) }
+    try { await sendMessage(text) } catch (e) { console.error(e) }
   }
 
   const onKey = e => {
@@ -384,150 +309,168 @@ export default function Chat() {
   }
 
   const handleMicClick = () => {
-    if (mic.recording) {
-      mic.stop(langCode, text => { if (text) setInput(text) })
-    } else {
-      mic.start()
-    }
+    if (mic.recording) mic.stop(langCode, text => { if (text) setInput(text) })
+    else mic.start()
   }
 
+  const fmt = ms => ms != null ? `${(ms / 1000).toFixed(1)}s` : null
+
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col overflow-hidden">
+
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <div className="px-5 py-3 flex items-center gap-3 shrink-0"
+      <div className="px-4 py-2.5 flex items-center gap-3 shrink-0"
            style={{ borderBottom: '1px solid #2a2a4a' }}>
-        <span className="text-xl">{userLang?.flag ?? '💬'}</span>
-        <div className="flex-1">
-          <h2 className="text-cream font-semibold text-sm">{userLang?.name ?? 'Sohbet'}</h2>
-          <p className="text-muted text-xs">Seviye: {userLang?.cefr_level ?? '—'}</p>
+        <span className="text-lg">{userLang?.flag ?? '💬'}</span>
+        <div className="flex-1 min-w-0">
+          <span className="text-cream font-semibold text-sm">{userLang?.name ?? 'Sohbet'}</span>
+          <span className="text-muted text-xs ml-2">{userLang?.cefr_level ?? '—'}</span>
         </div>
 
         {/* Scenario picker */}
         <div className="flex gap-1">
           {SCENARIOS.map(s => (
-            <button
-              key={s.id}
-              title={s.label}
-              onClick={() => setScenario(s.id)}
-              className={`w-8 h-8 rounded-lg text-sm transition-colors
+            <button key={s.id} title={s.label} onClick={() => setScenario(s.id)}
+              className={`w-7 h-7 rounded-lg text-xs transition-colors
                 ${scenario === s.id
                   ? 'bg-fox text-white'
-                  : 'bg-panel text-muted hover:bg-border hover:text-cream'}`}
-            >
+                  : 'bg-panel text-muted hover:bg-border hover:text-cream'}`}>
               {s.icon}
             </button>
           ))}
         </div>
 
-        {/* Voice conversation toggle */}
+        {/* Voice mode toggle */}
         {ttsOnline && (
-          <button
-            onClick={voice.toggle}
-            title={voice.voiceMode ? 'Sesli modu kapat' : 'Sesli konuşma modunu aç'}
+          <button onClick={voice.toggle}
+            title={voice.voiceMode ? 'Sesli modu kapat' : 'Sesli konuşma modu'}
             className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold
-                        transition-all border shrink-0
+                        border transition-all shrink-0
                         ${voice.voiceMode
-                          ? 'bg-green-500/20 text-green-400 border-green-500/40 shadow-lg shadow-green-500/10'
-                          : 'bg-panel text-muted border-border hover:border-fox/40 hover:text-cream'}`}
-          >
-            <span>{voice.voiceMode ? '🔴' : '🎙️'}</span>
-            <span className="hidden sm:inline">{voice.voiceMode ? 'Sesli Mod' : 'Sesli Konuş'}</span>
+                          ? 'bg-green-500/20 text-green-400 border-green-500/40'
+                          : 'bg-panel text-muted border-border hover:border-fox/40 hover:text-cream'}`}>
+            {voice.voiceMode ? '🔴' : '🎙️'}
+            <span>{voice.voiceMode ? 'Aktif' : 'Sesli Konuş'}</span>
           </button>
         )}
       </div>
 
-      {/* ── Voice status bar (only in voice mode) ──────────────────────────── */}
-      <AnimatePresence>
-        {voice.voiceMode && (
-          <motion.div
-            key="voice-bar"
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: 'auto', opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="overflow-hidden shrink-0"
-          >
-            <VoiceStatusBar state={voice.voiceState} timings={voice.timings} onStop={voice.stop} />
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* ── Body: fox panel + messages ──────────────────────────────────────── */}
+      <div className="flex-1 flex overflow-hidden">
 
-      {/* ── Messages ───────────────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-        {messages.length === 0 && (
-          <div className="h-full flex flex-col items-center justify-center text-center text-muted">
-            <span className="text-5xl mb-3">🦊</span>
-            <p className="text-sm">Konuşmaya başla, seninle pratik yapalım!</p>
-            <p className="text-xs mt-1 opacity-60">
-              Senaryo: {SCENARIOS.find(s => s.id === scenario)?.label}
-            </p>
-            {ttsOnline && !voice.voiceMode && (
-              <button
-                onClick={voice.toggle}
-                className="mt-4 flex items-center gap-2 px-4 py-2 rounded-xl text-sm
-                           bg-fox/10 text-fox border border-fox/20 hover:bg-fox/20 transition-colors"
-              >
-                <span>🎙️</span>
-                <span>Sesli konuşma modunu başlat</span>
-              </button>
-            )}
-          </div>
-        )}
+        {/* Fox panel */}
+        <div className="w-52 shrink-0 flex flex-col items-center justify-between py-5 px-3"
+             style={{ borderRight: '1px solid #2a2a4a', background: '#0f0f1f' }}>
 
-        <AnimatePresence initial={false}>
-          {messages.map(msg => (
-            <Bubble
-              key={msg.id}
-              msg={msg}
-              langCode={langCode}
-              ttsOnline={ttsOnline && !voice.voiceMode}
-              ttsLoadingId={tts.loadingId}
-              ttsPlayingId={tts.playingId}
-              onPlay={tts.play}
-              onStop={tts.stop}
-            />
-          ))}
-        </AnimatePresence>
+          <FoxAvatar state={foxState} />
 
-        {chatLoading && (
-          <div className="flex items-center gap-2">
-            <span className="text-lg">🦊</span>
-            <div className="bg-panel border border-border rounded-2xl rounded-bl-sm px-4 py-2.5">
-              <Dots />
+          {/* Timings */}
+          {(voice.timings.stt != null || voice.timings.llm != null || voice.timings.tts != null) && (
+            <div className="flex flex-col gap-1 w-full mt-3">
+              {voice.timings.stt != null && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted">🎙 Ses tanıma</span>
+                  <span className="text-fox font-mono">{fmt(voice.timings.stt)}</span>
+                </div>
+              )}
+              {voice.timings.llm != null && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted">🦊 Yapay zeka</span>
+                  <span className="text-fox font-mono">{fmt(voice.timings.llm)}</span>
+                </div>
+              )}
+              {voice.timings.tts != null && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted">🔊 Ses üretimi</span>
+                  <span className="text-fox font-mono">{fmt(voice.timings.tts)}</span>
+                </div>
+              )}
             </div>
+          )}
+
+          {/* Last heard */}
+          {voice.lastHeard && (
+            <div className="w-full mt-3 px-3 py-2 bg-surface rounded-xl text-xs text-muted italic leading-relaxed line-clamp-3">
+              "{voice.lastHeard}"
+            </div>
+          )}
+
+          {/* Stop voice button */}
+          {voice.voiceMode && (
+            <button onClick={voice.stop}
+              className="mt-3 w-full py-1.5 text-xs text-danger border border-danger/30
+                         bg-danger/10 hover:bg-danger/20 rounded-xl transition-colors">
+              ✕ Sesli Modu Kapat
+            </button>
+          )}
+        </div>
+
+        {/* Messages panel */}
+        <div className="flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+
+            {messages.length === 0 && (
+              <div className="h-full flex flex-col items-center justify-center text-center text-muted gap-3">
+                <p className="text-sm">Konuşmaya başla, seninle pratik yapalım!</p>
+                <p className="text-xs opacity-60">
+                  {SCENARIOS.find(s => s.id === scenario)?.icon}{' '}
+                  {SCENARIOS.find(s => s.id === scenario)?.label}
+                </p>
+                {ttsOnline && !voice.voiceMode && (
+                  <button onClick={voice.toggle}
+                    className="mt-2 flex items-center gap-2 px-4 py-2 rounded-xl text-sm
+                               bg-fox/10 text-fox border border-fox/20 hover:bg-fox/20 transition-colors">
+                    <span>🎙️</span><span>Sesli konuşmayı başlat</span>
+                  </button>
+                )}
+              </div>
+            )}
+
+            <AnimatePresence initial={false}>
+              {messages.map(msg => (
+                <Bubble
+                  key={msg.id} msg={msg} langCode={langCode}
+                  ttsOnline={ttsOnline && !voice.voiceMode}
+                  ttsLoadingId={tts.loadingId} ttsPlayingId={tts.playingId}
+                  onPlay={tts.play} onStop={tts.stop}
+                />
+              ))}
+            </AnimatePresence>
+
+            {chatLoading && (
+              <div className="flex items-center gap-2">
+                <div className="bg-panel border border-border rounded-2xl rounded-bl-sm px-4 py-2.5">
+                  <Dots />
+                </div>
+              </div>
+            )}
+            <div ref={bottomRef} />
           </div>
-        )}
-        <div ref={bottomRef} />
+        </div>
       </div>
 
       {/* ── Input bar ──────────────────────────────────────────────────────── */}
       <div className={`px-4 py-3 shrink-0 transition-opacity
-                       ${voice.voiceMode ? 'opacity-30 pointer-events-none' : ''}`}
+                       ${voice.voiceMode ? 'opacity-25 pointer-events-none' : ''}`}
            style={{ borderTop: '1px solid #2a2a4a' }}>
         {!ollamaOnline && (
           <p className="text-danger text-xs text-center mb-2">
             Ollama bağlı değil — <code className="font-mono">ollama serve</code>
           </p>
         )}
-
         {mic.transcribing && (
           <div className="flex items-center gap-2 mb-2 text-xs text-fox">
-            <Dots color="fox" />
-            <span>Ses tanınıyor…</span>
+            <Dots /><span>Ses tanınıyor…</span>
           </div>
         )}
 
         <div className="flex gap-2">
-          {/* Mic button (manual mode) */}
-          <button
-            onClick={handleMicClick}
+          <button onClick={handleMicClick}
             disabled={mic.transcribing || chatLoading || voice.voiceMode}
-            title={mic.recording ? 'Kaydı durdur' : 'Sesle yaz'}
             className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all shrink-0
               ${mic.recording
                 ? 'bg-danger text-white animate-pulse shadow-lg shadow-danger/40'
-                : 'bg-panel border border-border text-muted hover:border-fox/40 hover:text-cream disabled:opacity-30'}`}
-          >
+                : 'bg-panel border border-border text-muted hover:border-fox/40 hover:text-cream disabled:opacity-30'}`}>
             {mic.recording ? '⏹' : '🎙️'}
           </button>
 
@@ -535,111 +478,21 @@ export default function Chat() {
             value={input}
             onChange={e => setInput(e.target.value)}
             onKeyDown={onKey}
-            placeholder={mic.recording ? '🔴 Kaydediliyor… (tekrar tıkla = dur)' : 'Mesajını yaz... (Enter = gönder)'}
+            placeholder={mic.recording ? '🔴 Kaydediliyor…' : 'Mesajını yaz… (Enter = gönder)'}
             rows={2}
             disabled={chatLoading || !ollamaOnline || mic.transcribing || voice.voiceMode}
             className="flex-1 bg-panel border border-border hover:border-fox/30 focus:border-fox
                        rounded-xl px-4 py-2.5 text-cream text-sm resize-none
                        focus:outline-none placeholder-muted disabled:opacity-40 transition-colors"
           />
-          <button
-            onClick={handleSend}
+          <button onClick={handleSend}
             disabled={chatLoading || !input.trim() || !ollamaOnline || voice.voiceMode}
             className="px-5 bg-fox hover:bg-fox-light disabled:opacity-30
-                       text-white font-bold rounded-xl transition-colors text-lg shrink-0"
-          >
+                       text-white font-bold rounded-xl transition-colors text-lg shrink-0">
             ➤
           </button>
         </div>
       </div>
-    </div>
-  )
-}
-
-// ─── Voice Status Bar ─────────────────────────────────────────────────────────
-const VOICE_STATES = {
-  listening:    { icon: '🎙️', label: 'Dinliyorum…',        color: '#22c55e' },
-  transcribing: { icon: '📝', label: 'Sesi çözüyorum…',    color: '#f59e0b' },
-  thinking:     { icon: '🦊', label: 'Düşünüyorum…',       color: '#e07b39' },
-  speaking:     { icon: '🔊', label: 'Konuşuyorum…',       color: '#818cf8' },
-  idle:         { icon: '⏳', label: 'Hazırlanıyor…',      color: '#6b7280' },
-}
-
-function VoiceStatusBar({ state, timings, onStop }) {
-  const s = VOICE_STATES[state] ?? VOICE_STATES.idle
-
-  // Format ms → "1.2s"
-  const fmt = ms => ms != null ? `${(ms / 1000).toFixed(1)}s` : null
-
-  return (
-    <div
-      className="flex items-center gap-3 px-5 py-3"
-      style={{ background: s.color + '10', borderBottom: `1px solid ${s.color}30` }}
-    >
-      <motion.span
-        key={state}
-        animate={
-          state === 'listening'
-            ? { scale: [1, 1.3, 1], opacity: [1, 0.6, 1] }
-            : state === 'speaking'
-              ? { scale: [1, 1.15, 1] }
-              : { scale: 1, opacity: 1 }
-        }
-        transition={{ duration: 0.9, repeat: Infinity, ease: 'easeInOut' }}
-        className="text-xl"
-      >
-        {s.icon}
-      </motion.span>
-
-      <span className="text-sm font-medium" style={{ color: s.color }}>
-        {s.label}
-      </span>
-
-      {(state === 'thinking' || state === 'transcribing') && <Dots />}
-
-      {state === 'listening' && (
-        <div className="relative flex items-center justify-center w-5 h-5">
-          {[0, 1].map(i => (
-            <motion.div
-              key={i}
-              className="absolute rounded-full border"
-              style={{ borderColor: s.color }}
-              animate={{ scale: [1, 2], opacity: [0.6, 0] }}
-              transition={{ duration: 1.5, repeat: Infinity, delay: i * 0.75 }}
-            />
-          ))}
-          <div className="w-2 h-2 rounded-full" style={{ background: s.color }} />
-        </div>
-      )}
-
-      {/* Timing badges — shown after the first full cycle */}
-      {(timings.stt != null || timings.llm != null || timings.tts != null) && (
-        <div className="flex gap-2 ml-2">
-          {timings.stt != null && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
-              🎙 {fmt(timings.stt)}
-            </span>
-          )}
-          {timings.llm != null && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
-              🦊 {fmt(timings.llm)}
-            </span>
-          )}
-          {timings.tts != null && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-black/20 text-muted font-mono">
-              🔊 {fmt(timings.tts)}
-            </span>
-          )}
-        </div>
-      )}
-
-      <button
-        onClick={onStop}
-        className="ml-auto px-3 py-1 text-xs rounded-lg border transition-colors
-                   bg-danger/10 text-danger border-danger/30 hover:bg-danger/20"
-      >
-        ✕ Kapat
-      </button>
     </div>
   )
 }
@@ -652,50 +505,41 @@ function Bubble({ msg, langCode, ttsOnline, ttsLoadingId, ttsPlayingId, onPlay, 
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
+      initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
       className={`flex gap-2 ${isUser ? 'justify-end' : 'justify-start'}`}
     >
-      {!isUser && <span className="text-xl mt-0.5 shrink-0">🦊</span>}
-      <div className={`flex flex-col gap-1 max-w-[78%] ${isUser ? 'items-end' : 'items-start'}`}>
+      <div className={`flex flex-col gap-1 max-w-[85%] ${isUser ? 'items-end' : 'items-start'}`}>
         <div className={`px-4 py-2.5 rounded-2xl text-sm leading-relaxed
           ${isUser
             ? 'bg-fox text-white rounded-br-sm'
-            : 'bg-panel border border-border text-cream rounded-bl-sm'}`}
-        >
+            : 'bg-panel border border-border text-cream rounded-bl-sm'}`}>
           {msg.content}
         </div>
 
-        {/* Corrections badge */}
         {!isUser && msg.corrections && !/^none$/i.test(msg.corrections.trim()) && (
           <div className="px-3 py-1.5 bg-amber-500/10 border border-amber-500/30
                           rounded-lg text-xs text-amber-400 max-w-full">
             <span className="font-semibold mr-1">✏️</span>
             {msg.corrections.split('|').map((c, i, arr) => (
               <span key={i} className="inline-block">
-                {c.trim()}
-                {i < arr.length - 1 && <span className="mx-1.5 opacity-40">·</span>}
+                {c.trim()}{i < arr.length - 1 && <span className="mx-1.5 opacity-40">·</span>}
               </span>
             ))}
           </div>
         )}
 
-        {/* TTS play button (hidden during voice conversation mode) */}
         {!isUser && ttsOnline && (
           <button
             onClick={() => isPlaying ? onStop() : onPlay(msg.id, msg.content, langCode)}
             disabled={isLoading}
-            title={isPlaying ? 'Durdur' : 'Sesli dinle'}
             className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs
                        text-muted hover:text-cream bg-panel border border-border
-                       hover:border-fox/30 transition-colors disabled:opacity-40"
-          >
+                       hover:border-fox/30 transition-colors disabled:opacity-40">
             {isLoading
               ? <><Dots /><span>Üretiliyor…</span></>
               : isPlaying
                 ? <><span>⏹</span><span>Durdur</span></>
-                : <><span>🔊</span><span>Dinle</span></>
-            }
+                : <><span>🔊</span><span>Dinle</span></>}
           </button>
         )}
       </div>
@@ -708,12 +552,9 @@ function Dots() {
   return (
     <div className="flex gap-1 items-center h-4">
       {[0, 1, 2].map(i => (
-        <motion.span
-          key={i}
-          className="w-1.5 h-1.5 rounded-full bg-muted"
+        <motion.span key={i} className="w-1.5 h-1.5 rounded-full bg-muted"
           animate={{ opacity: [0.3, 1, 0.3] }}
-          transition={{ duration: 1, repeat: Infinity, delay: i * 0.2 }}
-        />
+          transition={{ duration: 1, repeat: Infinity, delay: i * 0.2 }} />
       ))}
     </div>
   )
