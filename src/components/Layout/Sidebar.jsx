@@ -5,8 +5,9 @@ import KitsuneMascot from '../Kitsune/KitsuneMascot'
 const NAV = [
   { to: '/',          icon: '🏠', label: 'Ana Sayfa', end: true },
   { to: '/chat',      icon: '💬', label: 'Konuş'     },
-  { to: '/learn',     icon: '📚', label: 'Öğren'     },
-  { to: '/dashboard', icon: '📊', label: 'İlerleme'  },
+  { to: '/learn',      icon: '📚', label: 'Öğren'     },
+  { to: '/vocabulary', icon: '🃏', label: 'Kelimeler' },
+  { to: '/dashboard',  icon: '📊', label: 'İlerleme'  },
   { to: '/languages', icon: '🌍', label: 'Diller'    },
 ]
 

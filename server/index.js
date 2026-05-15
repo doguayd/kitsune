@@ -7,6 +7,7 @@ import userRoutes from './routes/user.js'
 import assessmentRoutes from './routes/assessment.js'
 import voiceRoutes from './routes/voice.js'
 import learnRoutes from './routes/learn.js'
+import vocabRoutes from './routes/vocabulary.js'
 import { initModelProcesses } from './services/modelManager.js'
 
 // Port: 3717 — き(3)つ(7)ね(1)... Japanese reading of kitsune digits
@@ -31,6 +32,7 @@ export async function startServer() {
   app.use('/api/assessment', assessmentRoutes)
   app.use('/api/voice',      voiceRoutes)
   app.use('/api/learn',      learnRoutes)
+  app.use('/api/vocab',      vocabRoutes)
 
   app.get('/health', (_req, res) =>
     res.json({ status: 'ok', version: '0.1.0', name: 'Kitsune' })

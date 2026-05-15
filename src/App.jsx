@@ -8,6 +8,7 @@ import Languages from './pages/Languages'
 import Assessment from './pages/Assessment'
 import Onboarding from './pages/Onboarding'
 import Learn from './pages/Learn'
+import Vocabulary from './pages/Vocabulary'
 import { useStore } from './store/useStore'
 
 function FirstLaunchGuard({ children }) {
@@ -48,6 +49,7 @@ export default function App() {
             <Route path="/assessment"  element={<Assessment />} />
             <Route path="/onboarding"  element={<Onboarding />} />
             <Route path="/learn"       element={<Learn />} />
+            <Route path="/vocabulary"  element={<Vocabulary />} />
             <Route path="*"            element={<Navigate to="/" />} />
           </Routes>
         </FirstLaunchGuard>
